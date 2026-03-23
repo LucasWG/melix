@@ -66,6 +66,40 @@ const handleMessage = (ws, raw, state) => {
             case "chat_private":
                 (0, chat_1.sendPrivateChat)(state.clients, { ...message, from: currentDevice ?? message.from });
                 break;
+            case "chat_private_read": {
+                if (!currentDevice || !message.messageId || !message.to) {
+                    return;
+                }
+                const targetWs = state.clients.get(message.to);
+                if (!targetWs) {
+                    return;
+                }
+                targetWs.send(JSON.stringify({
+                    type: "chat_private_read",
+                    from: currentDevice,
+                    to: message.to,
+                    messageId: message.messageId,
+                    timestamp: Date.now()
+                }));
+                break;
+            }
+            case "chat_global_read": {
+                if (!currentDevice || !message.messageId) {
+                    return;
+                }
+                if (!state.globalReadReceipts.has(message.messageId)) {
+                    state.globalReadReceipts.set(message.messageId, new Set());
+                }
+                state.globalReadReceipts.get(message.messageId)?.add(currentDevice);
+                state.app.publish("melix:all", JSON.stringify({
+                    type: "chat_global_read",
+                    messageId: message.messageId,
+                    from: currentDevice,
+                    readers: [...(state.globalReadReceipts.get(message.messageId) ?? new Set())],
+                    timestamp: Date.now()
+                }));
+                break;
+            }
             case "broadcast":
                 (0, broadcast_1.sendBroadcast)(state.app, { ...message, from: currentDevice ?? message.from });
                 break;

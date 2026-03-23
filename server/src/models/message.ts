@@ -6,6 +6,8 @@ export type MelixEventType =
   | "chat_global"
   | "chat_room"
   | "chat_private"
+  | "chat_private_read"
+  | "chat_global_read"
   | "join_room"
   | "leave_room"
   | "broadcast"
@@ -24,6 +26,8 @@ export interface MelixMessage {
   to?: string;
   room?: string;
   message?: string;
+  messageId?: string;
+  readers?: string[];
   clipboardId?: string;
   level?: NotificationLevel;
   timestamp?: number;

@@ -23,6 +23,7 @@ export interface MelixState {
   rooms: Map<string, Set<string>>;
   onlineUsers: Set<string>;
   clipboardHistory: import("../services/clipboard").ClipboardItem[];
+  globalReadReceipts: Map<string, Set<string>>;
 }
 
 export const handleMessage = (ws: WebSocket<WsData>, raw: ArrayBuffer, state: MelixState): void => {
@@ -87,6 +88,45 @@ export const handleMessage = (ws: WebSocket<WsData>, raw: ArrayBuffer, state: Me
       case "chat_private":
         sendPrivateChat(state.clients, { ...message, from: currentDevice ?? message.from });
         break;
+      case "chat_private_read": {
+        if (!currentDevice || !message.messageId || !message.to) {
+          return;
+        }
+        const targetWs = state.clients.get(message.to);
+        if (!targetWs) {
+          return;
+        }
+        targetWs.send(
+          JSON.stringify({
+            type: "chat_private_read",
+            from: currentDevice,
+            to: message.to,
+            messageId: message.messageId,
+            timestamp: Date.now()
+          } satisfies MelixMessage)
+        );
+        break;
+      }
+      case "chat_global_read": {
+        if (!currentDevice || !message.messageId) {
+          return;
+        }
+        if (!state.globalReadReceipts.has(message.messageId)) {
+          state.globalReadReceipts.set(message.messageId, new Set<string>());
+        }
+        state.globalReadReceipts.get(message.messageId)?.add(currentDevice);
+        state.app.publish(
+          "melix:all",
+          JSON.stringify({
+            type: "chat_global_read",
+            messageId: message.messageId,
+            from: currentDevice,
+            readers: [...(state.globalReadReceipts.get(message.messageId) ?? new Set<string>())],
+            timestamp: Date.now()
+          } satisfies MelixMessage)
+        );
+        break;
+      }
       case "broadcast":
         sendBroadcast(state.app, { ...message, from: currentDevice ?? message.from });
         break;

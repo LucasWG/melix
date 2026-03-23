@@ -13,6 +13,7 @@ export const startWebSocketServer = ({ host, port }: MelixServerOptions): Templa
   const rooms = new Map<string, Set<string>>();
   const onlineUsers = new Set<string>();
   const clipboardHistory: ClipboardItem[] = [];
+  const globalReadReceipts = new Map<string, Set<string>>();
 
   const app = uWS.App();
 
@@ -39,7 +40,8 @@ export const startWebSocketServer = ({ host, port }: MelixServerOptions): Templa
         clients,
         rooms,
         onlineUsers,
-        clipboardHistory
+        clipboardHistory,
+        globalReadReceipts
       });
     },
     close: (ws) => {
@@ -48,7 +50,8 @@ export const startWebSocketServer = ({ host, port }: MelixServerOptions): Templa
         clients,
         rooms,
         onlineUsers,
-        clipboardHistory
+        clipboardHistory,
+        globalReadReceipts
       });
     }
   });

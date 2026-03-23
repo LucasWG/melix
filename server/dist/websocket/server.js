@@ -12,6 +12,7 @@ const startWebSocketServer = ({ host, port }) => {
     const rooms = new Map();
     const onlineUsers = new Set();
     const clipboardHistory = [];
+    const globalReadReceipts = new Map();
     const app = uWebSockets_js_1.default.App();
     app.ws("/ws", {
         compression: uWebSockets_js_1.default.SHARED_COMPRESSOR,
@@ -30,7 +31,8 @@ const startWebSocketServer = ({ host, port }) => {
                 clients,
                 rooms,
                 onlineUsers,
-                clipboardHistory
+                clipboardHistory,
+                globalReadReceipts
             });
         },
         close: (ws) => {
@@ -39,7 +41,8 @@ const startWebSocketServer = ({ host, port }) => {
                 clients,
                 rooms,
                 onlineUsers,
-                clipboardHistory
+                clipboardHistory,
+                globalReadReceipts
             });
         }
     });
