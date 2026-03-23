@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Melix Client
 // @namespace    https://debugzone.com.br/
-// @version      4.0.0
-// @description  Cliente Melix com UI profissional
+// @version      5.0.0
+// @description  Cliente Melix com notificacoes unificadas
 // @author       Melix
 // @match        *://*/*
 // @grant        GM_setClipboard
@@ -13,33 +13,41 @@
 ;(function () {
 	'use strict'
 
-	const MELIX_ENV = 'development' // 'development' | 'production'
+	const MELIX_ENV = 'development' // 'auto' | 'development' | 'production'
+	const WS_URL_OVERRIDE_KEY = 'melix_ws_url_override'
 	const WS_ENDPOINTS = {
 		development: 'ws://127.0.0.1:3001/ws',
 		production: 'wss://melix.debugzone.com.br/ws'
 	}
-	const WS_URL = WS_ENDPOINTS[MELIX_ENV] || WS_ENDPOINTS.production
-
+	const resolveWsUrl = () => {
+		const override = localStorage.getItem(WS_URL_OVERRIDE_KEY)
+		if (override) {
+			const isValidOverride = /^wss?:\/\/.+/i.test(override)
+			if (isValidOverride) return override
+			localStorage.removeItem(WS_URL_OVERRIDE_KEY)
+		}
+		if (MELIX_ENV === 'development') return WS_ENDPOINTS.development
+		if (MELIX_ENV === 'production') return WS_ENDPOINTS.production
+		const isLocalPage = ['localhost', '127.0.0.1'].includes(window.location.hostname)
+		return isLocalPage ? WS_ENDPOINTS.development : WS_ENDPOINTS.production
+	}
+	const WS_URL = resolveWsUrl()
+	const WS_CANDIDATES = [...new Set([WS_URL, WS_ENDPOINTS.development, WS_ENDPOINTS.production])]
 	const DEVICE_ID_KEY = 'melix_device_id'
+	const GLOBAL_DEVICE_ID_KEY = 'melix_global_device_id'
 	const ACTIVE_TAB_KEY = 'melix_active_tab'
 	const UI_MINIMIZED_KEY = 'melix_ui_minimized'
-	const GLOBAL_DEVICE_ID_KEY = 'melix_global_device_id'
+	const COMPOSER_TABS = new Set(['global'])
 
 	const getGlobalDeviceId = () => {
 		try {
-			const existing = typeof GM_getValue === 'function' ? GM_getValue(GLOBAL_DEVICE_ID_KEY) : null
+			const existing =
+				typeof GM_getValue === 'function' ? GM_getValue(GLOBAL_DEVICE_ID_KEY) : null
 			if (existing) return String(existing)
 		} catch (_error) {}
-
-		const localExisting = localStorage.getItem(DEVICE_ID_KEY)
-		if (localExisting) {
-			try {
-				if (typeof GM_setValue === 'function') GM_setValue(GLOBAL_DEVICE_ID_KEY, localExisting)
-			} catch (_error) {}
-			return localExisting
-		}
-
-		const generated = `device-${Math.random().toString(36).slice(2, 10)}`
+		const generated =
+			localStorage.getItem(DEVICE_ID_KEY) ||
+			`device-${Math.random().toString(36).slice(2, 10)}`
 		try {
 			if (typeof GM_setValue === 'function') GM_setValue(GLOBAL_DEVICE_ID_KEY, generated)
 		} catch (_error) {}
@@ -48,196 +56,257 @@
 	}
 
 	const deviceId = getGlobalDeviceId()
-	localStorage.setItem(DEVICE_ID_KEY, deviceId)
-
 	let socket = null
 	let reconnectTimer = null
 	let pingTimer = null
-	const COMPOSER_TABS = new Set(['global'])
+	let wsCandidateIndex = 0
+	let notifSeq = 0
+	let feedRenderFrame = null
+	const notifTimeouts = new Map()
 
 	const state = {
 		isConnected: false,
 		isMinimized: localStorage.getItem(UI_MINIMIZED_KEY) !== 'false',
+		activeTab: localStorage.getItem(ACTIVE_TAB_KEY) || 'global',
 		users: [],
 		clipboard: [],
-		activeTab: localStorage.getItem(ACTIVE_TAB_KEY) || 'global',
 		privateTabs: [],
+		privateFeeds: {},
+		globalReadByMessage: {},
+		privateReadByMessage: {},
+		readSentRegistry: new Set(),
 		unreadTabs: {},
+		notifications: [],
 		feeds: {
 			global: [],
 			users: [],
 			log: [],
 			system: []
-		},
-		privateFeeds: {}
+		}
 	}
 
 	const dom = {
 		root: null,
+		title: null,
 		statusDot: null,
 		statusText: null,
 		toggleBtn: null,
-		wsGate: null,
-		app: null,
 		standardTabBar: null,
 		privateTabBar: null,
+		body: null,
 		feed: null,
-		title: null,
 		compose: null,
 		input: null,
 		sendBtn: null,
 		clipBtn: null,
-		floatingMessage: null,
+		gate: null,
+		notifications: null,
 		tabs: {}
 	}
 
-	const send = (payload) => {
+	const uiState = {
+		lastFeedSignature: '',
+		animatedMessageIds: new Set()
+	}
+
+	const injectEnhancementStyles = () => {
+		if (document.getElementById('melix-enhance-style')) return
+		const style = document.createElement('style')
+		style.id = 'melix-enhance-style'
+		style.textContent = `
+			@keyframes melixFadeUp {
+				from { opacity: 0; transform: translateY(8px); }
+				to { opacity: 1; transform: translateY(0); }
+			}
+			@keyframes melixFadeIn {
+				from { opacity: 0; transform: scale(.98); }
+				to { opacity: 1; transform: scale(1); }
+			}
+			.melix-enter { animation: melixFadeUp .18s ease-out; }
+			.melix-enter-soft { animation: melixFadeIn .16s ease-out; }
+			#melix-root {
+				font-family: Inter, "Proxima Nova", "Segoe UI", Roboto, Arial, sans-serif !important;
+				font-size: clamp(12px, 0.72vw, 14px);
+			}
+		`
+		document.head.appendChild(style)
+	}
+
+	const ensureTailwind = () =>
+		new Promise(resolve => {
+			let done = false
+			const finish = () => {
+				if (done) return
+				done = true
+				resolve()
+			}
+
+			// Nunca travar o app por causa de estilo.
+			setTimeout(finish, 1200)
+
+			if (window.tailwind) return finish()
+			const existing = document.getElementById('melix-tailwind')
+			if (existing) {
+				existing.addEventListener('load', finish, { once: true })
+				existing.addEventListener('error', finish, { once: true })
+				return
+			}
+			const script = document.createElement('script')
+			script.id = 'melix-tailwind'
+			script.src = 'https://cdn.tailwindcss.com'
+			script.onload = finish
+			script.onerror = finish
+			document.head.appendChild(script)
+		})
+
+	const icon = name => {
+		const map = {
+			chat: '<svg viewBox="0 0 24 24" class="w-4 h-4"><path fill="currentColor" d="M4 4h16v11H7l-3 3V4z"/></svg>',
+			users: '<svg viewBox="0 0 24 24" class="w-4 h-4"><path fill="currentColor" d="M16 11a4 4 0 1 0-4-4a4 4 0 0 0 4 4M8 11a3 3 0 1 0-3-3a3 3 0 0 0 3 3m8 2c-2.67 0-8 1.34-8 4v3h16v-3c0-2.66-5.33-4-8-4M8 13c-.29 0-.62.02-.97.05A5.53 5.53 0 0 1 9 17v3H2v-3c0-2 3.33-4 6-4"/></svg>',
+			clip: '<svg viewBox="0 0 24 24" class="w-4 h-4"><path fill="currentColor" d="M16 4h-1.18A3 3 0 0 0 12 2a3 3 0 0 0-2.82 2H8a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h8v-2H8V6h2v1h4V6h2v7h2V6a2 2 0 0 0-2-2"/></svg>',
+			log: '<svg viewBox="0 0 24 24" class="w-4 h-4"><path fill="currentColor" d="M3 4h18v2H3zm0 7h18v2H3zm0 7h12v2H3z"/></svg>',
+			private:
+				'<svg viewBox="0 0 24 24" class="w-4 h-4"><path fill="currentColor" d="M12 1a5 5 0 0 0-5 5v3H6a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V11a2 2 0 0 0-2-2h-1V6a5 5 0 0 0-5-5m-3 8V6a3 3 0 0 1 6 0v3z"/></svg>',
+			send: '<svg viewBox="0 0 24 24" class="w-4 h-4"><path fill="currentColor" d="M2 21l20-9L2 3v7l14 2l-14 2z"/></svg>'
+		}
+		return map[name] || ''
+	}
+
+	const create = (tag, className = '', text = '') => {
+		const el = document.createElement(tag)
+		if (className) el.className = className
+		if (text) el.textContent = text
+		return el
+	}
+
+	const send = payload => {
 		if (!socket || socket.readyState !== WebSocket.OPEN) {
-			toast('Sem conexao com servidor.', 'warning')
+			pushNotification({
+				title: 'Conexao',
+				message: 'Sem conexao com servidor.',
+				level: 'warning',
+				priority: null,
+				reuseKey: 'system-connection'
+			})
 			return
 		}
 		socket.send(JSON.stringify({ ...payload, from: deviceId, timestamp: Date.now() }))
 	}
 
-	const styles = `
-    #melix-root, #melix-root * { box-sizing: border-box; }
-    #melix-root {
-      position: fixed; right: 16px; bottom: 16px; width: 430px; height: 580px;
-      background: #0f1119; color: #e7eaf3; z-index: 2147483647;
-      border: 1px solid #2b354b; border-radius: 14px; overflow: hidden;
-      box-shadow: 0 20px 44px rgba(0,0,0,.45);
-      font: 13px/1.45 Inter, Segoe UI, Arial, sans-serif;
-      display: flex; flex-direction: column;
-    }
-    #melix-root.minimized { width: 320px; height: 54px; }
-    #melix-root.minimized #melix-tabs-main,
-    #melix-root.minimized #melix-tabs-private,
-    #melix-root.minimized #melix-body,
-    #melix-root.minimized #melix-gate { display: none !important; }
+	const formatStamp = (ts = Date.now()) =>
+		new Date(ts).toLocaleTimeString('pt-BR', {
+			hour: '2-digit',
+			minute: '2-digit',
+			second: '2-digit'
+		})
 
-    #melix-header {
-      height: 54px; flex: 0 0 auto; padding: 10px 12px; border-bottom: 1px solid #273149;
-      display: flex; align-items: center; justify-content: space-between;
-      background: linear-gradient(180deg, #12192a 0%, #111726 100%);
-    }
-    #melix-title { font-weight: 700; display: flex; align-items: center; gap: 8px; }
-    .melix-dot { width: 8px; height: 8px; border-radius: 999px; background: #f59e0b; }
-    #melix-sub { color: #9fb0cb; font-size: 12px; }
+	const createMessageId = () => `m_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`
 
-    #melix-tabs-main, #melix-tabs-private {
-      flex: 0 0 auto; display: flex; align-items: center; gap: 6px;
-      padding: 8px; border-bottom: 1px solid #273149; overflow-x: auto;
-      scrollbar-width: thin;
-    }
-    #melix-tabs-private { background: #0d1422; min-height: 42px; }
-    .melix-tab {
-      border: 1px solid #34415b; background: #151d2e; color: #c9d5ea;
-      border-radius: 8px; padding: 6px 10px; white-space: nowrap; cursor: pointer;
-    }
-    .melix-tab.active { background: #27406f; border-color: #4a6fae; color: #fff; }
-    .melix-tab.unread {
-      border-color: #6ea4ff;
-      box-shadow: 0 0 0 1px rgba(110,164,255,.35) inset;
-      animation: melixPulse 1.2s infinite;
-    }
-    .melix-badge {
-      margin-left: 6px; min-width: 18px; height: 18px; border-radius: 999px;
-      background: #f97316; color: #fff; font-size: 11px; line-height: 18px; text-align: center; padding: 0 5px;
-      display: inline-block;
-    }
-    @keyframes melixPulse {
-      0% { box-shadow: 0 0 0 0 rgba(110,164,255,.35); }
-      70% { box-shadow: 0 0 0 6px rgba(110,164,255,0); }
-      100% { box-shadow: 0 0 0 0 rgba(110,164,255,0); }
-    }
+	const markVisibleMessagesAsRead = () => {
+		if (!socket || socket.readyState !== WebSocket.OPEN) return
 
-    #melix-body {
-      position: relative; flex: 1 1 auto; min-height: 0;
-      display: flex; flex-direction: column;
-    }
-    #melix-feed {
-      flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden;
-      padding: 10px; display: flex; flex-direction: column; gap: 8px;
-    }
-    .melix-msg { border: 1px solid #2b3852; border-radius: 10px; padding: 8px; background: #121929; }
-    .melix-msg.mine { border-color: #3d5f95; background: #172745; }
-    .melix-meta { color: #9cb0d0; font-size: 11px; margin-bottom: 4px; }
-    .melix-body { white-space: pre-wrap; word-break: break-word; }
-    .melix-chip {
-      display: inline-block; border: 1px solid #33435f; background: #141d2f;
-      color: #c5d1e8; border-radius: 999px; padding: 6px 10px; cursor: pointer;
-      margin: 0 6px 6px 0;
-    }
-    .melix-chip:hover { border-color: #4c6ea8; color: #fff; }
-
-    #melix-compose {
-      flex: 0 0 auto; border-top: 1px solid #273149; padding: 10px;
-      display: flex; gap: 8px; background: #0f1626;
-    }
-    .melix-input {
-      flex: 1 1 auto; min-width: 0; background: #0f1524; color: #eef2fb;
-      border: 1px solid #33435f; border-radius: 8px; padding: 8px;
-    }
-    .melix-btn {
-      border: 0; border-radius: 8px; background: #2f65d9; color: #fff;
-      padding: 8px 10px; cursor: pointer;
-    }
-    .melix-btn.alt { background: #26344f; }
-    .melix-btn.icon {
-      min-width: 34px; width: 34px; height: 34px; border-radius: 999px;
-      padding: 0; display: inline-flex; align-items: center; justify-content: center; font-weight: 700;
-    }
-
-    #melix-gate {
-      position: absolute; inset: 0; display: none; align-items: center; justify-content: center;
-      background: rgba(10,14,24,.9); color: #d6e1f4; text-align: center; padding: 16px;
-    }
-    #melix-gate.show { display: flex; }
-    #melix-toast {
-      position: fixed; right: 16px; bottom: 610px; display: grid; gap: 6px; z-index: 2147483647;
-    }
-    .melix-toast-item {
-      min-width: 220px; max-width: 360px; padding: 8px 10px; border-radius: 8px;
-      border: 1px solid #3b4d6d; background: #111826; color: #edf3ff;
-    }
-    .melix-toast-item.warning { border-color: #8a5f1d; }
-    .melix-toast-item.error { border-color: #8a1d2e; }
-    .melix-toast-item.success { border-color: #22643d; }
-
-    #melix-floating {
-      position: fixed; right: 16px; bottom: 72px; z-index: 2147483647;
-      max-width: 360px; border: 1px solid #3c5c90; border-radius: 10px;
-      background: #101a2d; color: #e8f1ff; padding: 10px; display: none;
-      cursor: pointer; box-shadow: 0 10px 24px rgba(0,0,0,.35);
-    }
-    #melix-floating.show { display: block; }
-    #melix-floating-title { font-size: 11px; color: #9eb4d9; margin-bottom: 4px; }
-    #melix-floating-text { font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  `
-
-	const injectStyles = () => {
-		if (document.getElementById('melix-style')) return
-		const style = document.createElement('style')
-		style.id = 'melix-style'
-		style.textContent = styles
-		document.head.appendChild(style)
-	}
-
-	const toast = (message, level = 'info') => {
-		let holder = document.getElementById('melix-toast')
-		if (!holder) {
-			holder = document.createElement('div')
-			holder.id = 'melix-toast'
-			document.body.appendChild(holder)
+		if (state.activeTab === 'global') {
+			const feed = state.feeds.global || []
+			for (const msg of feed) {
+				if (!msg?.messageId || msg.from === deviceId) continue
+				const key = `g:${msg.messageId}`
+				if (state.readSentRegistry.has(key)) continue
+				state.readSentRegistry.add(key)
+				send({ type: 'chat_global_read', messageId: msg.messageId })
+			}
+			return
 		}
-		const item = document.createElement('div')
-		item.className = `melix-toast-item ${level}`
-		item.textContent = message
-		holder.appendChild(item)
-		setTimeout(() => item.remove(), 3000)
+
+		if (state.activeTab.startsWith('private:')) {
+			const target = state.activeTab.replace('private:', '')
+			const feed = state.privateFeeds[target] || []
+			for (const msg of feed) {
+				if (!msg?.messageId || msg.from === deviceId) continue
+				const key = `p:${msg.messageId}`
+				if (state.readSentRegistry.has(key)) continue
+				state.readSentRegistry.add(key)
+				send({ type: 'chat_private_read', messageId: msg.messageId, to: target })
+			}
+		}
 	}
 
-	const playAlert = (priority) => {
+	const statusLabel = () => {
+		if (!socket) return 'Desconectado'
+		if (socket.readyState === WebSocket.OPEN) return 'Conectado'
+		if (socket.readyState === WebSocket.CONNECTING) return 'Conectando...'
+		return 'Desconectado'
+	}
+
+	const pushNotification = ({
+		title,
+		message,
+		level = 'info',
+		tabId = null,
+		priority = 'normal',
+		reuseKey = null
+	}) => {
+		let item = null
+		if (reuseKey) {
+			item = state.notifications.find(n => n.reuseKey === reuseKey) || null
+		}
+		if (item) {
+			item.title = title
+			item.message = message
+			item.level = level
+			item.tabId = tabId
+			state.notifications = [item, ...state.notifications.filter(n => n.id !== item.id)]
+		} else {
+			item = { id: `n_${++notifSeq}`, title, message, level, tabId, reuseKey }
+			state.notifications.unshift(item)
+		}
+		state.notifications = state.notifications.slice(0, 6)
+		renderNotifications()
+		if (priority) playAlert(priority)
+		const timeoutKey = reuseKey || item.id
+		if (notifTimeouts.has(timeoutKey)) {
+			clearTimeout(notifTimeouts.get(timeoutKey))
+		}
+		const timeoutId = setTimeout(() => {
+			state.notifications = state.notifications.filter(n => n.id !== item.id)
+			renderNotifications()
+			notifTimeouts.delete(timeoutKey)
+		}, 5500)
+		notifTimeouts.set(timeoutKey, timeoutId)
+	}
+
+	const renderNotifications = () => {
+		if (!dom.notifications) return
+		dom.notifications.innerHTML = ''
+		for (const n of state.notifications) {
+			const levelClass =
+				n.level === 'error'
+					? 'border-red-500/70'
+					: n.level === 'warning'
+						? 'border-amber-500/70'
+						: n.level === 'success'
+							? 'border-emerald-500/70'
+							: 'border-sky-500/70'
+			const card = create(
+				'button',
+				`w-full text-left rounded-lg border ${levelClass} bg-slate-900 px-3 py-2 shadow-lg`
+			)
+			card.classList.add('melix-enter-soft')
+			const h = create('div', 'text-[11px] text-slate-300', n.title)
+			const m = create('div', 'text-xs text-slate-100 truncate', n.message || 'Nova notificacao')
+			card.append(h, m)
+			card.onclick = () => {
+				if (n.tabId) {
+					setMinimized(false)
+					activateTab(n.tabId)
+				}
+				state.notifications = state.notifications.filter(x => x.id !== n.id)
+				renderNotifications()
+			}
+			dom.notifications.appendChild(card)
+		}
+	}
+
+	const playAlert = priority => {
 		const AudioCtx = window.AudioContext || window.webkitAudioContext
 		if (!AudioCtx) return
 		const ctx = new AudioCtx()
@@ -254,7 +323,6 @@
 			osc.start(ctx.currentTime + delay)
 			osc.stop(ctx.currentTime + delay + duration)
 		}
-
 		if (priority === 'high') {
 			beep(880, 0.09, 0)
 			beep(1040, 0.09, 0.12)
@@ -264,341 +332,281 @@
 		setTimeout(() => ctx.close(), 450)
 	}
 
-	const showFloatingMessage = (title, message, targetTab) => {
-		if (!dom.floatingMessage) return
-		dom.floatingMessage.querySelector('#melix-floating-title').textContent = title
-		dom.floatingMessage.querySelector('#melix-floating-text').textContent = message || 'Nova mensagem'
-		dom.floatingMessage.classList.add('show')
-		dom.floatingMessage.onclick = () => {
-			setMinimized(false)
-			activateTab(targetTab)
-			dom.floatingMessage.classList.remove('show')
-		}
-		setTimeout(() => {
-			if (dom.floatingMessage) dom.floatingMessage.classList.remove('show')
-		}, 6000)
-	}
-
-	const statusLabel = () => {
-		if (!socket) return 'offline'
-		if (socket.readyState === WebSocket.OPEN) return 'online'
-		if (socket.readyState === WebSocket.CONNECTING) return 'conectando'
-		return 'offline'
-	}
-
-	const setStatus = () => {
-		const status = statusLabel()
-		if (!dom.statusText || !dom.statusDot) return
-		dom.statusText.textContent =
-			status === 'online'
-				? 'Conectado'
-				: status === 'conectando'
-					? 'Conectando...'
-					: 'Desconectado'
-		dom.statusDot.style.background =
-			status === 'online' ? '#10b981' : status === 'conectando' ? '#f59e0b' : '#ef4444'
-	}
-
-	const stamp = (ts = Date.now()) =>
-		new Date(ts).toLocaleTimeString('pt-BR', {
-			hour: '2-digit',
-			minute: '2-digit',
-			second: '2-digit'
-		})
-
-	const normalizeTab = (tabId) => {
-		if (tabId.startsWith('private:')) return tabId
-		if (['users', 'global', 'clipboard', 'log'].includes(tabId)) return tabId
-		return 'global'
-	}
-
-	const getFeedForTab = (tabId) => {
-		if (tabId === 'global') return state.feeds.global
-		if (tabId === 'users') return state.feeds.users
-		if (tabId === 'log') return state.feeds.log
-		if (tabId === 'clipboard') return []
-		if (tabId.startsWith('private:')) {
-			const target = tabId.replace('private:', '')
-			return state.privateFeeds[target] || []
-		}
-		return []
-	}
-
-	const renderFeed = () => {
-		if (!dom.feed) return
-		if (state.activeTab === 'clipboard') {
-			renderClipboard()
-			return
-		}
-		if (state.activeTab === 'users') {
-			renderUsersListAsMain()
-			return
-		}
-
-		dom.feed.innerHTML = ''
-		const base = getFeedForTab(state.activeTab)
-		const feed = [...base].slice(-80)
-		if (!feed.length) {
-			const empty = document.createElement('div')
-			empty.className = 'melix-meta'
-			empty.textContent = 'Sem mensagens ainda.'
-			dom.feed.appendChild(empty)
-			return
-		}
-		feed.forEach(msg => {
-			const card = document.createElement('div')
-			card.className = `melix-msg ${msg.from === deviceId ? 'mine' : ''}`
-			const meta = document.createElement('div')
-			meta.className = 'melix-meta'
-			meta.textContent = `${msg.type} • ${msg.from || 'system'} • ${stamp(msg.timestamp)}`
-			const body = document.createElement('div')
-			body.className = 'melix-body'
-			body.textContent = msg.message || ''
-			card.appendChild(meta)
-			card.appendChild(body)
-			dom.feed.appendChild(card)
-		})
-		dom.feed.scrollTop = dom.feed.scrollHeight
-	}
-
-	const activateTab = (tabId) => {
-		const normalized = normalizeTab(tabId)
-		state.activeTab = normalized
-		localStorage.setItem(ACTIVE_TAB_KEY, normalized)
-		clearUnread(normalized)
-		Object.entries(dom.tabs).forEach(([id, element]) => {
-			element.classList.toggle('active', id === normalized)
-		})
-
-		if (dom.title) {
-			dom.title.textContent = normalized.startsWith('private:')
-				? `MELIX • PRIVATE • ${normalized.replace('private:', '')}`
-				: `MELIX • ${normalized.toUpperCase()}`
-		}
-		setComposerVisibility()
-		renderFeed()
-	}
-
-	const setComposerVisibility = () => {
-		if (!dom.compose || !dom.input || !dom.sendBtn || !dom.clipBtn) return
-		const isPrivateTab = state.activeTab.startsWith('private:')
-		const canCompose = COMPOSER_TABS.has(state.activeTab) || isPrivateTab
-		dom.compose.style.display = canCompose && state.isConnected ? 'flex' : 'none'
-		if (!canCompose) {
-			dom.input.value = ''
-		}
+	const addLog = message => {
+		state.feeds.log.push({ type: 'log', from: 'melix', message, timestamp: Date.now() })
+		state.feeds.log = state.feeds.log.slice(-120)
+		if (state.activeTab === 'log') renderFeed()
 	}
 
 	const addFeed = (tab, entry) => {
 		if (!state.feeds[tab]) return
 		state.feeds[tab].push(entry)
-		if (state.feeds[tab].length > 120) state.feeds[tab].shift()
-		if (state.activeTab === tab) renderFeed()
+		state.feeds[tab] = state.feeds[tab].slice(-120)
+		if (state.activeTab === tab) scheduleRenderFeed()
 	}
 
-	const addLog = (message) => {
-		addFeed('log', {
-			type: 'log',
-			from: 'melix',
-			message,
-			timestamp: Date.now()
-		})
+	const normalizeTab = tabId => {
+		if (tabId.startsWith('private:')) return tabId
+		return ['users', 'global', 'clipboard', 'log'].includes(tabId) ? tabId : 'global'
 	}
 
-	const getUnreadCount = (tabId) => Number(state.unreadTabs[tabId] || 0)
+	const getFeedForTab = tabId => {
+		if (tabId === 'global') return state.feeds.global
+		if (tabId === 'users') return state.feeds.users
+		if (tabId === 'log') return state.feeds.log
+		if (tabId.startsWith('private:'))
+			return state.privateFeeds[tabId.replace('private:', '')] || []
+		return []
+	}
 
-	const incrementUnread = (tabId) => {
-		state.unreadTabs[tabId] = getUnreadCount(tabId) + 1
+	const getUnread = tabId => Number(state.unreadTabs[tabId] || 0)
+	const incrementUnread = tabId => {
+		state.unreadTabs[tabId] = getUnread(tabId) + 1
 		buildTabs()
 	}
-
-	const clearUnread = (tabId) => {
+	const clearUnread = tabId => {
 		if (!state.unreadTabs[tabId]) return
 		delete state.unreadTabs[tabId]
 		buildTabs()
 	}
 
-	const ensurePrivateTab = (targetDeviceId, shouldFocus = false) => {
-		const tabId = `private:${targetDeviceId}`
-		if (!state.privateTabs.includes(targetDeviceId)) {
-			state.privateTabs.push(targetDeviceId)
-			state.privateFeeds[targetDeviceId] = state.privateFeeds[targetDeviceId] || []
+	const isTabVisible = tabId => state.activeTab === tabId && !state.isMinimized
+
+	const ensurePrivateTab = (target, focus = false) => {
+		if (!state.privateTabs.includes(target)) {
+			state.privateTabs.push(target)
+			state.privateFeeds[target] = state.privateFeeds[target] || []
 			buildTabs()
 		}
-		if (shouldFocus) activateTab(tabId)
+		if (focus) activateTab(`private:${target}`)
 	}
 
-	const addPrivateMessage = (targetDeviceId, data, shouldFocus = false) => {
-		ensurePrivateTab(targetDeviceId, false)
-		const list = state.privateFeeds[targetDeviceId]
-		list.push(data)
-		if (list.length > 120) list.shift()
-		if (shouldFocus || state.activeTab === `private:${targetDeviceId}`) {
-			activateTab(`private:${targetDeviceId}`)
-		}
+	const addPrivateMessage = (target, message) => {
+		ensurePrivateTab(target, false)
+		state.privateFeeds[target].push(message)
+		state.privateFeeds[target] = state.privateFeeds[target].slice(-120)
+		if (state.activeTab === `private:${target}`) scheduleRenderFeed()
 	}
 
-	const renderUsersListAsMain = () => {
-		if (!dom.feed) return
-		dom.feed.innerHTML = ''
-		if (!state.users.length) {
-			const empty = document.createElement('div')
-			empty.className = 'melix-meta'
-			empty.textContent = 'Nenhum device conectado.'
-			dom.feed.appendChild(empty)
-			return
-		}
-		state.users.forEach((user) => {
-			const item = document.createElement('button')
-			item.className = 'melix-chip'
-			item.textContent = user
-			item.onclick = () => ensurePrivateTab(user, true)
-			dom.feed.appendChild(item)
-		})
+	const setComposerVisibility = () => {
+		if (!dom.compose) return
+		const canCompose =
+			COMPOSER_TABS.has(state.activeTab) || state.activeTab.startsWith('private:')
+		dom.compose.style.display = canCompose && state.isConnected ? 'flex' : 'none'
 	}
 
-	const renderUsers = () => {
-		if (state.activeTab === 'users') renderUsersListAsMain()
-	}
-
-	const renderClipboard = () => {
-		if (!dom.feed) return
-		dom.feed.innerHTML = ''
-		if (!state.clipboard.length) {
-			const empty = document.createElement('div')
-			empty.className = 'melix-meta'
-			empty.textContent = 'Clipboard vazio.'
-			dom.feed.appendChild(empty)
-			return
-		}
-		state.clipboard.forEach((entry, index) => {
-			const item =
-				typeof entry === 'string'
-					? { id: `legacy_${index}`, content: entry, owner: 'desconhecido' }
-					: entry
-			const row = document.createElement('div')
-			row.className = 'melix-msg'
-			const meta = document.createElement('div')
-			meta.className = 'melix-meta'
-			meta.textContent = `Item ${index + 1} • ${item.owner}`
-			const body = document.createElement('div')
-			body.className = 'melix-body'
-			body.textContent = item.content
-			const copy = document.createElement('button')
-			copy.className = 'melix-btn alt'
-			copy.style.marginTop = '6px'
-			copy.textContent = 'Copiar'
-			copy.onclick = () => {
-				GM_setClipboard(item.content)
-				toast('Copiado para o clipboard.', 'success')
-			}
-			row.append(meta, body, copy)
-
-			if (item.owner === deviceId && item.id && !String(item.id).startsWith('legacy_')) {
-				const del = document.createElement('button')
-				del.className = 'melix-btn alt'
-				del.style.marginTop = '6px'
-				del.style.marginLeft = '6px'
-				del.textContent = 'Apagar'
-				del.onclick = () => send({ type: 'clipboard_delete', clipboardId: item.id })
-				row.append(del)
-			}
-			dom.feed.appendChild(row)
-		})
+	const setStatus = () => {
+		if (!dom.statusText || !dom.statusDot) return
+		const label = statusLabel()
+		dom.statusText.textContent = label
+		dom.statusDot.className =
+			'w-2 h-2 rounded-full ' +
+			(label === 'Conectado'
+				? 'bg-emerald-400'
+				: label === 'Conectando...'
+					? 'bg-amber-400'
+					: 'bg-rose-400')
 	}
 
 	const setConnectionGate = () => {
-		if (
-			!dom.wsGate ||
-			!dom.app ||
-			!dom.input ||
-			!dom.sendBtn ||
-			!dom.clipBtn ||
-			!dom.standardTabBar ||
-			!dom.privateTabBar
-		)
-			return
-		if (state.isConnected) {
-			dom.wsGate.classList.remove('show')
-			dom.app.classList.remove('hide')
-			dom.input.disabled = false
-			dom.sendBtn.disabled = false
-			dom.clipBtn.disabled = false
-			dom.standardTabBar.style.display = 'flex'
-			dom.privateTabBar.style.display = 'flex'
-			setComposerVisibility()
-			return
-		}
-
-		dom.wsGate.classList.add('show')
-		dom.app.classList.add('hide')
-		dom.input.disabled = true
-		dom.sendBtn.disabled = true
-		dom.clipBtn.disabled = true
-		dom.standardTabBar.style.display = 'none'
-		dom.privateTabBar.style.display = 'none'
-		setComposerVisibility()
+		if (!dom.gate) return
+		dom.gate.style.display = state.isConnected ? 'none' : 'flex'
+		if (!state.isConnected) dom.gate.textContent = 'Conectando ao Melix...'
 	}
 
-	const setMinimized = (minimized) => {
+	const setMinimized = minimized => {
 		state.isMinimized = minimized
 		localStorage.setItem(UI_MINIMIZED_KEY, minimized ? 'true' : 'false')
 		if (!dom.root || !dom.toggleBtn) return
-		dom.root.classList.toggle('minimized', minimized)
-		dom.toggleBtn.textContent = minimized ? '▲' : '▼'
+		dom.root.style.height = minimized ? '54px' : '590px'
+		dom.root.style.width = minimized ? '320px' : '440px'
+		const mainParts = dom.root.querySelectorAll('.melix-main')
+		mainParts.forEach(el => {
+			el.style.display = minimized ? 'none' : ''
+		})
+		dom.toggleBtn.innerHTML = minimized ? '▲' : '▼'
 		dom.toggleBtn.title = minimized ? 'Abrir chat' : 'Minimizar chat'
-		if (!minimized && dom.floatingMessage) {
-			dom.floatingMessage.classList.remove('show')
-		}
 	}
 
-	const isTabVisible = (tabId) => state.activeTab === tabId && !state.isMinimized
-
-	const notifyIncomingMessage = ({ tabId, text, priority, floatingTitle }) => {
+	const notifyIncomingMessage = ({ tabId, title, text, priority }) => {
 		if (isTabVisible(tabId)) return
 		incrementUnread(tabId)
-		playAlert(priority)
-		if (state.isMinimized) {
-			showFloatingMessage(floatingTitle, text, tabId)
-		}
-	}
-
-	const sendFromComposer = () => {
-		const text = (dom.input.value || '').trim()
-		if (!text) return
-
-		if (state.activeTab === 'global') {
-			send({ type: 'chat_global', message: text })
-			dom.input.value = ''
-			return
-		}
-
-		if (state.activeTab.startsWith('private:')) {
-			const to = state.activeTab.replace('private:', '')
-			send({ type: 'chat_private', to, message: text })
-			addPrivateMessage(to, {
-				type: 'chat_private',
-				from: deviceId,
-				to,
-				message: text,
-				timestamp: Date.now()
-			})
-			dom.input.value = ''
-			return
-		}
-
-		toast('Abra GLOBAL ou uma aba PRIVATE.', 'warning')
-	}
-
-	const create = (tag, attrs = {}, text = '') => {
-		const el = document.createElement(tag)
-		Object.entries(attrs).forEach(([k, v]) => {
-			if (k === 'class') el.className = v
-			else if (k === 'id') el.id = v
-			else el.setAttribute(k, v)
+		pushNotification({
+			title,
+			message: text,
+			tabId,
+			priority
 		})
-		if (text) el.textContent = text
-		return el
+	}
+
+	const renderUsersList = () => {
+		dom.feed.innerHTML = ''
+		if (!state.users.length) {
+			dom.feed.appendChild(
+				create('div', 'text-xs text-slate-400', 'Nenhum device conectado.')
+			)
+			return
+		}
+		dom.feed.appendChild(
+			create('div', 'mb-3 text-xs font-medium text-slate-400', `${state.users.length} devices online`)
+		)
+		const wrap = create('div', 'grid grid-cols-1 gap-2')
+		for (const user of state.users) {
+			const card = create('div', 'rounded-lg border border-slate-700 bg-slate-900 p-3 melix-enter')
+			const top = create('div', 'flex items-center justify-between')
+			const idText = create('div', 'text-xs font-semibold text-slate-100', user)
+			const status = create('span', 'rounded-full bg-emerald-500/20 px-2 py-0.5 text-[10px] text-emerald-300', 'Disponivel')
+			top.append(idText, status)
+
+			const meta = create('div', 'mt-1 text-[11px] text-slate-400', `Canal privado disponivel • ID ${user.slice(0, 18)}...`)
+			const actions = create('div', 'mt-2 flex gap-2')
+			const openBtn = create('button', 'rounded bg-[#2d6cdf] px-2 py-1 text-[11px] text-white hover:bg-[#2258b8]', 'Abrir chat')
+			openBtn.onclick = () => ensurePrivateTab(user, true)
+			const copyBtn = create('button', 'rounded bg-slate-700 px-2 py-1 text-[11px] text-slate-100 hover:bg-slate-600', 'Copiar ID')
+			copyBtn.onclick = () => {
+				GM_setClipboard(user)
+				pushNotification({ title: 'Usuarios', message: `ID ${user} copiado.`, level: 'success', priority: null })
+			}
+			actions.append(openBtn, copyBtn)
+
+			card.append(top, meta, actions)
+			wrap.appendChild(card)
+		}
+		dom.feed.appendChild(wrap)
+	}
+
+	const renderClipboard = () => {
+		dom.feed.innerHTML = ''
+		if (!state.clipboard.length) {
+			dom.feed.appendChild(create('div', 'text-xs text-slate-400', 'Clipboard vazio.'))
+			return
+		}
+		for (let i = 0; i < state.clipboard.length; i++) {
+			const raw = state.clipboard[i]
+			const item =
+				typeof raw === 'string'
+					? { id: `legacy_${i}`, owner: 'desconhecido', content: raw }
+					: raw
+			const card = create('div', 'rounded-lg border border-slate-700 bg-slate-900 p-3')
+			card.classList.add('melix-enter')
+			card.appendChild(
+				create('div', 'mb-1 text-[11px] text-slate-400', `Item ${i + 1} • ${item.owner}`)
+			)
+			card.appendChild(
+				create('div', 'whitespace-pre-wrap break-words text-xs text-slate-100', item.content)
+			)
+			const actions = create('div', 'mt-2 flex gap-2')
+			const copy = create(
+				'button',
+				'rounded bg-[#2d6cdf] px-2 py-1 text-[11px] text-white hover:bg-[#2258b8]',
+				'Copiar'
+			)
+			copy.onclick = () => {
+				GM_setClipboard(item.content)
+				pushNotification({
+					title: 'Clipboard',
+					message: 'Copiado.',
+					level: 'success',
+					priority: null
+				})
+			}
+			actions.appendChild(copy)
+			if (item.owner === deviceId && item.id && !String(item.id).startsWith('legacy_')) {
+				const del = create(
+					'button',
+					'rounded bg-rose-700 px-2 py-1 text-[11px] text-white',
+					'Apagar'
+				)
+				del.onclick = () => send({ type: 'clipboard_delete', clipboardId: item.id })
+				actions.appendChild(del)
+			}
+			card.appendChild(actions)
+			dom.feed.appendChild(card)
+		}
+	}
+
+	const getFeedSignature = feed =>
+		feed
+			.slice(-100)
+			.map(msg => `${msg.messageId || ''}:${msg.timestamp || ''}:${msg.from || ''}:${msg.message || ''}`)
+			.join('|')
+
+	const scheduleRenderFeed = () => {
+		if (feedRenderFrame) return
+		feedRenderFrame = requestAnimationFrame(() => {
+			feedRenderFrame = null
+			renderFeed()
+		})
+	}
+
+	const invalidateFeedRender = () => {
+		uiState.lastFeedSignature = ''
+	}
+
+	const renderFeed = () => {
+		if (!dom.feed) return
+		if (state.activeTab === 'users') return renderUsersList()
+		if (state.activeTab === 'clipboard') return renderClipboard()
+		const feed = getFeedForTab(state.activeTab)
+		const signature = `${state.activeTab}::${getFeedSignature(feed)}`
+		if (signature === uiState.lastFeedSignature) return
+		uiState.lastFeedSignature = signature
+		const previousScrollBottom = dom.feed.scrollHeight - dom.feed.scrollTop - dom.feed.clientHeight
+		const shouldStickBottom = previousScrollBottom < 24
+		dom.feed.innerHTML = ''
+		if (!feed.length) {
+			dom.feed.appendChild(create('div', 'text-xs text-slate-400', 'Sem mensagens ainda.'))
+			return
+		}
+		for (const msg of feed.slice(-100)) {
+			const mine = msg.from === deviceId
+			const row = create('div', `flex ${mine ? 'justify-end' : 'justify-start'}`)
+			const card = create(
+				'div',
+				`max-w-[78%] rounded-xl border p-3 ${mine ? 'border-[#2d6cdf] bg-[#122646]' : 'border-slate-700 bg-slate-900'}`
+			)
+			if (msg.messageId && !uiState.animatedMessageIds.has(msg.messageId)) {
+				card.classList.add('melix-enter')
+				uiState.animatedMessageIds.add(msg.messageId)
+			}
+			card.appendChild(
+				create(
+					'div',
+					'mb-1 text-[11px] text-slate-400',
+					`${msg.type} • ${msg.from || 'system'} • ${formatStamp(msg.timestamp)}`
+				)
+			)
+			const body = create(
+				'div',
+				'whitespace-pre-wrap break-words text-xs text-slate-100',
+				msg.message || ''
+			)
+			card.appendChild(body)
+
+			const footer = create('div', 'mt-2 flex items-center gap-2 text-[10px] text-slate-400')
+			if (state.activeTab === 'global' && mine && msg.messageId) {
+				const viewers = state.globalReadByMessage[msg.messageId] || []
+				const viewedIcon = create('span', 'cursor-help select-none', '👁')
+				viewedIcon.title = viewers.length
+					? `Visualizado por: ${viewers.join(', ')}`
+					: 'Ainda nao visualizada'
+				footer.append(viewedIcon, create('span', '', `${viewers.length} visualizaram`))
+			}
+			if (state.activeTab.startsWith('private:') && mine && msg.messageId) {
+				const read = Boolean(state.privateReadByMessage[msg.messageId])
+				const readMark = create('span', read ? 'text-emerald-400' : 'text-slate-500', read ? '✓✓' : '✓')
+				readMark.title = read ? 'Lida' : 'Enviada'
+				footer.append(readMark, create('span', '', read ? 'Lida' : 'Enviada'))
+			}
+			if (footer.childElementCount > 0) {
+				card.appendChild(footer)
+			}
+			row.appendChild(card)
+			dom.feed.appendChild(row)
+		}
+		if (shouldStickBottom) {
+			dom.feed.scrollTop = dom.feed.scrollHeight
+		}
 	}
 
 	const buildTabs = () => {
@@ -606,114 +614,214 @@
 		dom.standardTabBar.innerHTML = ''
 		dom.privateTabBar.innerHTML = ''
 		dom.tabs = {}
-
-		const fixedTabs = [
-			{ id: 'users', label: 'USUARIOS' },
-			{ id: 'global', label: 'GLOBAL' },
-			{ id: 'clipboard', label: 'CLIPBOARD' },
-			{ id: 'log', label: 'LOG' }
+		const fixed = [
+			{ id: 'users', label: 'USUARIOS', icon: 'users' },
+			{ id: 'global', label: 'GLOBAL', icon: 'chat' },
+			{ id: 'clipboard', label: 'CLIPBOARD', icon: 'clip' },
+			{ id: 'log', label: 'LOG', icon: 'log' }
 		]
-
-		fixedTabs.forEach(tab => {
-			const button = create('button', { class: 'melix-tab' }, tab.label)
-			button.onclick = () => activateTab(tab.id)
-			const unread = getUnreadCount(tab.id)
-			if (unread > 0) {
-				button.classList.add('unread')
-				button.appendChild(create('span', { class: 'melix-badge' }, String(unread)))
+		for (const t of fixed) {
+			const b = create(
+				'button',
+				'flex items-center gap-1 rounded border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-slate-200 hover:border-[#2d6cdf]'
+			)
+			b.innerHTML = `${icon(t.icon)}<span>${t.label}</span>`
+			const unread = getUnread(t.id)
+			if (unread) {
+				b.classList.add('ring-1', 'ring-sky-400', 'animate-pulse')
+				b.innerHTML += `<span class="ml-1 rounded-full bg-orange-500 px-1.5 text-[10px] text-white">${unread > 9 ? '9+' : unread}</span>`
 			}
-			dom.tabs[tab.id] = button
-			dom.standardTabBar.appendChild(button)
-		})
-
-		state.privateTabs.forEach(target => {
-			const id = `private:${target}`
-			const button = create('button', { class: 'melix-tab' }, `PRIVATE • ${target}`)
-			button.onclick = () => activateTab(id)
-			const unread = getUnreadCount(id)
-			if (unread > 0) {
-				button.classList.add('unread')
-				button.appendChild(create('span', { class: 'melix-badge' }, String(unread)))
+			b.onclick = () => activateTab(t.id)
+			dom.standardTabBar.appendChild(b)
+			dom.tabs[t.id] = b
+		}
+		for (const p of state.privateTabs) {
+			const id = `private:${p}`
+			const b = create(
+				'button',
+				'flex items-center gap-1 rounded border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-slate-200 hover:border-[#2d6cdf]'
+			)
+			b.innerHTML = `${icon('private')}<span>PRIVATE • ${p}</span>`
+			const unread = getUnread(id)
+			if (unread) {
+				b.classList.add('ring-1', 'ring-sky-400', 'animate-pulse')
+				b.innerHTML += `<span class="ml-1 rounded-full bg-orange-500 px-1.5 text-[10px] text-white">${unread > 9 ? '9+' : unread}</span>`
 			}
-			dom.tabs[id] = button
-			dom.privateTabBar.appendChild(button)
+			b.onclick = () => activateTab(id)
+			dom.privateTabBar.appendChild(b)
+			dom.tabs[id] = b
+		}
+		Object.entries(dom.tabs).forEach(([id, el]) => {
+			applyTabVisualState(el, id === state.activeTab)
 		})
+	}
 
-		Object.entries(dom.tabs).forEach(([id, element]) => {
-			element.classList.toggle('active', id === state.activeTab)
+	const applyTabVisualState = (el, active) => {
+		if (!el) return
+		if (active) {
+			el.style.background = 'linear-gradient(180deg, #2d6cdf 0%, #1f4fa3 100%)'
+			el.style.borderColor = '#5c8de6'
+			el.style.color = '#ffffff'
+			el.style.boxShadow = '0 0 0 2px rgba(92,141,230,0.45), inset 0 0 0 1px rgba(255,255,255,0.08)'
+			el.style.fontWeight = '600'
+		} else {
+			el.style.background = ''
+			el.style.borderColor = ''
+			el.style.color = ''
+			el.style.boxShadow = ''
+			el.style.fontWeight = ''
+		}
+	}
+
+	const activateTab = tabId => {
+		const normalized = normalizeTab(tabId)
+		state.activeTab = normalized
+		localStorage.setItem(ACTIVE_TAB_KEY, normalized)
+		clearUnread(normalized)
+		if (dom.title) {
+			dom.title.innerHTML = `${icon('chat')}<span>${normalized.startsWith('private:') ? `MELIX • PRIVATE • ${normalized.replace('private:', '')}` : `MELIX • ${normalized.toUpperCase()}`}</span>`
+		}
+		Object.entries(dom.tabs).forEach(([id, el]) => {
+			applyTabVisualState(el, id === normalized)
+		})
+		setComposerVisibility()
+		renderFeed()
+		markVisibleMessagesAsRead()
+	}
+
+	const sendFromComposer = () => {
+		const text = (dom.input.value || '').trim()
+		if (!text) return
+		const messageId = createMessageId()
+		if (state.activeTab === 'global') {
+			send({ type: 'chat_global', message: text, messageId })
+			state.globalReadByMessage[messageId] = []
+			dom.input.value = ''
+			return
+		}
+		if (state.activeTab.startsWith('private:')) {
+			const to = state.activeTab.replace('private:', '')
+			send({ type: 'chat_private', to, message: text, messageId })
+			state.privateReadByMessage[messageId] = false
+			addPrivateMessage(to, {
+				type: 'chat_private',
+				from: deviceId,
+				to,
+				messageId,
+				message: text,
+				timestamp: Date.now()
+			})
+			dom.input.value = ''
+			return
+		}
+		pushNotification({
+			title: 'Melix',
+			message: 'Abra GLOBAL ou PRIVATE.',
+			level: 'warning',
+			priority: null
 		})
 	}
 
 	const buildUi = () => {
-		injectStyles()
-		const root = create('div', { id: 'melix-root' })
+		const root = create(
+			'div',
+			'fixed bottom-4 right-4 z-[2147483647] flex h-[590px] w-[440px] flex-col overflow-hidden rounded-xl border border-slate-700 bg-slate-950 text-slate-100 shadow-2xl'
+		)
+		root.id = 'melix-root'
 		dom.root = root
 
-		const header = create('div', { id: 'melix-header' })
-		dom.title = create('div', { id: 'melix-title' }, 'MELIX • GLOBAL')
-		dom.statusDot = create('span', { class: 'melix-dot' })
-		dom.title.prepend(dom.statusDot)
-		dom.statusText = create('div', { id: 'melix-sub' }, 'conectando')
-		const headerRight = create('div')
-		headerRight.style.display = 'flex'
-		headerRight.style.alignItems = 'center'
-		headerRight.style.gap = '8px'
-		headerRight.style.alignItems = 'center'
-		dom.toggleBtn = create('button', { class: 'melix-btn icon alt', title: 'Abrir chat' }, '▲')
+		const header = create(
+			'div',
+			'flex h-14 items-center justify-between border-b border-slate-700 bg-gradient-to-b from-slate-900 to-slate-950 px-3'
+		)
+		dom.title = create('div', 'flex items-center gap-2 text-sm font-semibold')
+		dom.title.innerHTML = `${icon('chat')}<span>MELIX • GLOBAL</span>`
+		const right = create('div', 'flex items-center gap-2')
+		dom.statusDot = create('span', 'h-2 w-2 rounded-full bg-amber-400')
+		dom.statusText = create('span', 'text-xs text-slate-300', 'Conectando...')
+		dom.toggleBtn = create(
+			'button',
+			'h-8 w-8 rounded-full bg-[#2d6cdf] text-sm text-white hover:bg-[#2258b8]',
+			'▲'
+		)
 		dom.toggleBtn.onclick = () => setMinimized(!state.isMinimized)
-		headerRight.append(dom.statusText, dom.toggleBtn)
-		header.append(dom.title, headerRight)
-		root.appendChild(header)
+		right.append(dom.statusDot, dom.statusText, dom.toggleBtn)
+		header.append(dom.title, right)
 
-		dom.standardTabBar = create('div', { id: 'melix-tabs-main' })
-		root.appendChild(dom.standardTabBar)
-		dom.privateTabBar = create('div', { id: 'melix-tabs-private' })
-		root.appendChild(dom.privateTabBar)
+		dom.standardTabBar = create(
+			'div',
+			'melix-main flex gap-2 overflow-x-auto border-b border-slate-700 bg-slate-900/70 p-2'
+		)
+		dom.privateTabBar = create(
+			'div',
+			'melix-main flex gap-2 overflow-x-auto border-b border-slate-700 bg-slate-900/40 p-2'
+		)
 
-		dom.app = create('div', { id: 'melix-body' })
-
-		dom.feed = create('div', { id: 'melix-feed' })
-		dom.app.appendChild(dom.feed)
-
-		const compose = create('div', { id: 'melix-compose' })
-		dom.compose = compose
-		dom.input = create('input', {
-			class: 'melix-input',
-			placeholder: 'Digite e pressione Enter'
-		})
+		dom.body = create('div', 'melix-main relative flex min-h-0 flex-1 flex-col')
+		dom.feed = create('div', 'flex-1 overflow-y-auto p-3')
+		dom.compose = create('div', 'flex gap-2 border-t border-slate-700 bg-slate-900/70 p-3')
+		dom.input = create(
+			'input',
+			'min-w-0 flex-1 rounded border border-slate-600 bg-slate-900 px-2 py-2 text-xs text-slate-100 outline-none focus:border-[#2d6cdf]'
+		)
+		dom.input.placeholder = 'Digite sua mensagem...'
 		dom.input.onkeydown = event => {
-			if (event.key === 'Enter' && !event.shiftKey) {
+			if (event.key === 'Enter') {
 				event.preventDefault()
 				sendFromComposer()
 			}
 		}
-		dom.sendBtn = create('button', { class: 'melix-btn' }, 'Enviar')
+		dom.sendBtn = create(
+			'button',
+			'inline-flex items-center whitespace-nowrap rounded bg-[#2d6cdf] px-3 py-2 text-xs text-white hover:bg-[#2258b8]'
+		)
+		dom.sendBtn.innerHTML = `${icon('send')}<span class="ml-1 leading-none">Enviar</span>`
 		dom.sendBtn.onclick = sendFromComposer
-		dom.clipBtn = create('button', { class: 'melix-btn alt' }, 'Salvar')
+		dom.clipBtn = create(
+			'button',
+			'rounded bg-slate-700 px-3 py-2 text-xs text-slate-100 hover:bg-slate-600',
+			'Salvar'
+		)
 		dom.clipBtn.onclick = () => {
 			const text = (dom.input.value || '').trim()
-			if (!text) return toast('Digite um texto para salvar no clipboard.', 'warning')
+			if (!text) {
+				pushNotification({
+					title: 'Clipboard',
+					message: 'Digite um texto para salvar.',
+					level: 'warning',
+					priority: null
+				})
+				return
+			}
 			send({ type: 'clipboard_add', message: text })
-			toast('Item salvo no clipboard.', 'success')
+			pushNotification({
+				title: 'Clipboard',
+				message: 'Item salvo.',
+				level: 'success',
+				priority: null
+			})
 			dom.input.value = ''
 		}
-		compose.append(dom.input, dom.sendBtn, dom.clipBtn)
-		dom.app.appendChild(compose)
+		dom.compose.append(dom.input, dom.sendBtn, dom.clipBtn)
+		dom.body.append(dom.feed, dom.compose)
 
-		root.appendChild(dom.app)
+		dom.gate = create(
+			'div',
+			'absolute inset-0 z-20 hidden items-center justify-center bg-slate-950/90 text-xs text-slate-300',
+			'Conectando ao Melix...'
+		)
+		dom.body.appendChild(dom.gate)
 
-		dom.wsGate = create('div', { id: 'melix-gate', class: 'show' }, 'Conectando ao Melix...')
-		dom.app.appendChild(dom.wsGate)
+		dom.notifications = create(
+			'div',
+			'fixed right-4 top-4 z-[2147483647] grid w-[320px] max-w-[92vw] gap-2'
+		)
 
-		dom.floatingMessage = create('div', { id: 'melix-floating' })
-		dom.floatingMessage.appendChild(create('div', { id: 'melix-floating-title' }, 'Nova mensagem'))
-		dom.floatingMessage.appendChild(create('div', { id: 'melix-floating-text' }, ''))
-		document.body.appendChild(dom.floatingMessage)
-
-		document.body.appendChild(root)
+		root.append(header, dom.standardTabBar, dom.privateTabBar, dom.body)
+		document.body.append(root, dom.notifications)
 
 		buildTabs()
-		activateTab('global')
+		activateTab(state.activeTab)
 		setStatus()
 		setConnectionGate()
 		setMinimized(state.isMinimized)
@@ -722,80 +830,117 @@
 	const connect = () => {
 		state.isConnected = false
 		setConnectionGate()
-		socket = new WebSocket(WS_URL)
+		const currentUrl = WS_CANDIDATES[wsCandidateIndex % WS_CANDIDATES.length]
+		let opened = false
+		try {
+			socket = new WebSocket(currentUrl)
+		} catch (_error) {
+			wsCandidateIndex++
+			reconnectTimer = setTimeout(connect, 1200)
+			return
+		}
 		setStatus()
 
 		socket.onopen = () => {
+			opened = true
 			clearInterval(pingTimer)
 			pingTimer = setInterval(() => send({ type: 'ping' }), 30000)
 			send({ type: 'register' })
 			send({ type: 'clipboard_history' })
 			state.isConnected = true
 			setConnectionGate()
-			activateTab('global')
+			activateTab(state.activeTab)
 			setStatus()
 		}
-
 		socket.onclose = () => {
 			clearTimeout(reconnectTimer)
 			clearInterval(pingTimer)
 			state.isConnected = false
 			setConnectionGate()
 			setStatus()
-			reconnectTimer = setTimeout(connect, 2500)
+			if (!opened) wsCandidateIndex++
+			reconnectTimer = setTimeout(connect, opened ? 2500 : 1200)
 		}
-
-		socket.onmessage = (event) => {
+		socket.onerror = () => {
+			pushNotification({
+				title: 'Conexao',
+				message: `Falha ao conectar em ${currentUrl}`,
+				level: 'error',
+				priority: null,
+				reuseKey: 'system-connection'
+			})
+		}
+		socket.onmessage = event => {
 			const data = JSON.parse(event.data || '{}')
 			if (data.type === 'presence_list') {
 				state.users = JSON.parse(data.message || '[]')
-					.filter((user) => user !== deviceId)
+					.filter(u => u !== deviceId)
 					.sort()
-				renderUsers()
+				renderFeed()
 				return
 			}
-
 			if (data.type === 'clipboard_history') {
 				state.clipboard = JSON.parse(data.message || '[]')
 				if (state.activeTab === 'clipboard') renderClipboard()
 				return
 			}
-
 			if (data.type === 'notification') {
-				const isSelfJoinNotification =
-					data.from === deviceId && typeof data.message === 'string' && data.message.includes('entrou no Melix')
-				if (!isSelfJoinNotification) {
-					toast(data.message || 'Nova notificacao', data.level || 'info')
-				}
-				const isPresenceNotice =
+				const isSelfJoin =
+					data.from === deviceId &&
 					typeof data.message === 'string' &&
-					(data.message.includes('entrou no Melix') || data.message.includes('saiu'))
-				if (!isPresenceNotice) {
-					addLog(data.message || 'Notificacao recebida.')
+					data.message.includes('entrou no Melix')
+				if (!isSelfJoin) {
+					pushNotification({
+						title: 'Sistema',
+						message: data.message || 'Nova notificacao',
+						level: data.level || 'info',
+						priority: null,
+						reuseKey: 'system-notice'
+					})
 				}
+				return
 			}
-
 			if (data.type === 'chat_global') {
+				if (!data.messageId) data.messageId = createMessageId()
 				addFeed('global', data)
 				if (data.from !== deviceId) {
 					notifyIncomingMessage({
 						tabId: 'global',
-						text: `Global • ${data.from || 'device'}: ${data.message || ''}`,
-						priority: 'normal',
-						floatingTitle: 'Mensagem global'
+						title: 'Mensagem global',
+						text: `${data.from || 'device'}: ${data.message || ''}`,
+						priority: 'normal'
 					})
 				}
 			} else if (data.type === 'chat_private') {
+				if (!data.messageId) data.messageId = createMessageId()
 				const target = data.from === deviceId ? data.to : data.from
-				if (target) addPrivateMessage(target, data, false)
+				if (target) addPrivateMessage(target, data)
 				if (data.from !== deviceId && target) {
-					const privateTabId = `private:${target}`
+					const tabId = `private:${target}`
 					notifyIncomingMessage({
-						tabId: privateTabId,
-						text: `Privado • ${target}: ${data.message || ''}`,
-						priority: 'high',
-						floatingTitle: `PRIVATE • ${target}`
+						tabId,
+						title: `PRIVATE • ${target}`,
+						text: data.message || 'Nova mensagem privada',
+						priority: 'high'
 					})
+				}
+			} else if (data.type === 'chat_private_read') {
+				if (data.messageId) {
+					state.privateReadByMessage[data.messageId] = true
+					invalidateFeedRender()
+					scheduleRenderFeed()
+				}
+			} else if (data.type === 'chat_global_read') {
+				if (data.messageId) {
+					if (Array.isArray(data.readers)) {
+						state.globalReadByMessage[data.messageId] = [...data.readers]
+					} else if (data.from) {
+						const current = new Set(state.globalReadByMessage[data.messageId] || [])
+						current.add(data.from)
+						state.globalReadByMessage[data.messageId] = [...current]
+					}
+					invalidateFeedRender()
+					scheduleRenderFeed()
 				}
 			} else if (data.type === 'user_join' || data.type === 'user_leave') {
 				addFeed('users', data)
@@ -805,10 +950,17 @@
 			} else {
 				addLog(data.message || `Evento: ${data.type}`)
 			}
+			renderFeed()
+			markVisibleMessagesAsRead()
 		}
 	}
 
-	buildUi()
-	renderUsers()
-	connect()
+	const init = async () => {
+		await ensureTailwind()
+		injectEnhancementStyles()
+		buildUi()
+		connect()
+	}
+
+	init()
 })()
