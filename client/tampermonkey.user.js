@@ -80,8 +80,7 @@
 		feeds: {
 			global: [],
 			users: [],
-			log: [],
-			system: []
+			log: []
 		}
 	}
 
@@ -179,11 +178,20 @@
 		return el
 	}
 
+	const createBtn = (className, text, onClick) => {
+		const btn = create('button', className, text)
+		if (onClick) btn.onclick = onClick
+		return btn
+	}
+
+	const renderEmptyFeed = text => {
+		dom.feed.innerHTML = ''
+		dom.feed.appendChild(create('div', 'text-xs text-slate-400', text))
+	}
+
 	const send = payload => {
 		if (!socket || socket.readyState !== WebSocket.OPEN) {
-			pushNotification({
-				title: 'Conexao',
-				message: 'Sem conexao com servidor.',
+			notify('Conexao', 'Sem conexao com servidor.', {
 				level: 'warning',
 				priority: null,
 				reuseKey: 'system-connection'
@@ -202,31 +210,31 @@
 
 	const createMessageId = () => `m_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`
 
+	const markFeedMessagesAsRead = (feed, type, target) => {
+		for (const msg of feed) {
+			if (!msg?.messageId || msg.from === deviceId) continue
+			const key = `${type}:${msg.messageId}`
+			if (state.readSentRegistry.has(key)) continue
+			state.readSentRegistry.add(key)
+			send(
+				type === 'g'
+					? { type: 'chat_global_read', messageId: msg.messageId }
+					: { type: 'chat_private_read', messageId: msg.messageId, to: target }
+			)
+		}
+	}
+
 	const markVisibleMessagesAsRead = () => {
 		if (!socket || socket.readyState !== WebSocket.OPEN) return
 
 		if (state.activeTab === 'global') {
-			const feed = state.feeds.global || []
-			for (const msg of feed) {
-				if (!msg?.messageId || msg.from === deviceId) continue
-				const key = `g:${msg.messageId}`
-				if (state.readSentRegistry.has(key)) continue
-				state.readSentRegistry.add(key)
-				send({ type: 'chat_global_read', messageId: msg.messageId })
-			}
+			markFeedMessagesAsRead(state.feeds.global || [], 'g')
 			return
 		}
 
 		if (state.activeTab.startsWith('private:')) {
 			const target = state.activeTab.replace('private:', '')
-			const feed = state.privateFeeds[target] || []
-			for (const msg of feed) {
-				if (!msg?.messageId || msg.from === deviceId) continue
-				const key = `p:${msg.messageId}`
-				if (state.readSentRegistry.has(key)) continue
-				state.readSentRegistry.add(key)
-				send({ type: 'chat_private_read', messageId: msg.messageId, to: target })
-			}
+			markFeedMessagesAsRead(state.privateFeeds[target] || [], 'p', target)
 		}
 	}
 
@@ -273,6 +281,12 @@
 		}, 5500)
 		notifTimeouts.set(timeoutKey, timeoutId)
 	}
+
+	const notify = (
+		title,
+		message,
+		{ level = 'info', tabId = null, priority = 'normal', reuseKey = null } = {}
+	) => pushNotification({ title, message, level, tabId, priority, reuseKey })
 
 	const renderNotifications = () => {
 		if (!dom.notifications) return
@@ -351,9 +365,7 @@
 	}
 
 	const getFeedForTab = tabId => {
-		if (tabId === 'global') return state.feeds.global
-		if (tabId === 'users') return state.feeds.users
-		if (tabId === 'log') return state.feeds.log
+		if (tabId in state.feeds) return state.feeds[tabId]
 		if (tabId.startsWith('private:'))
 			return state.privateFeeds[tabId.replace('private:', '')] || []
 		return []
@@ -431,22 +443,15 @@
 	const notifyIncomingMessage = ({ tabId, title, text, priority }) => {
 		if (isTabVisible(tabId)) return
 		incrementUnread(tabId)
-		pushNotification({
-			title,
-			message: text,
-			tabId,
-			priority
-		})
+		notify(title, text, { tabId, priority })
 	}
 
 	const renderUsersList = () => {
-		dom.feed.innerHTML = ''
 		if (!state.users.length) {
-			dom.feed.appendChild(
-				create('div', 'text-xs text-slate-400', 'Nenhum device conectado.')
-			)
+			renderEmptyFeed('Nenhum device conectado.')
 			return
 		}
+		dom.feed.innerHTML = ''
 		dom.feed.appendChild(
 			create('div', 'mb-3 text-xs font-medium text-slate-400', `${state.users.length} devices online`)
 		)
@@ -460,13 +465,19 @@
 
 			const meta = create('div', 'mt-1 text-[11px] text-slate-400', `Canal privado disponivel • ID ${user.slice(0, 18)}...`)
 			const actions = create('div', 'mt-2 flex gap-2')
-			const openBtn = create('button', 'rounded bg-[#2d6cdf] px-2 py-1 text-[11px] text-white hover:bg-[#2258b8]', 'Abrir chat')
-			openBtn.onclick = () => ensurePrivateTab(user, true)
-			const copyBtn = create('button', 'rounded bg-slate-700 px-2 py-1 text-[11px] text-slate-100 hover:bg-slate-600', 'Copiar ID')
-			copyBtn.onclick = () => {
+			const openBtn = createBtn(
+				'rounded bg-[#2d6cdf] px-2 py-1 text-[11px] text-white hover:bg-[#2258b8]',
+				'Abrir chat',
+				() => ensurePrivateTab(user, true)
+			)
+			const copyBtn = createBtn(
+				'rounded bg-slate-700 px-2 py-1 text-[11px] text-slate-100 hover:bg-slate-600',
+				'Copiar ID',
+				() => {
 				GM_setClipboard(user)
-				pushNotification({ title: 'Usuarios', message: `ID ${user} copiado.`, level: 'success', priority: null })
-			}
+				notify('Usuarios', `ID ${user} copiado.`, { level: 'success', priority: null })
+				}
+			)
 			actions.append(openBtn, copyBtn)
 
 			card.append(top, meta, actions)
@@ -476,11 +487,11 @@
 	}
 
 	const renderClipboard = () => {
-		dom.feed.innerHTML = ''
 		if (!state.clipboard.length) {
-			dom.feed.appendChild(create('div', 'text-xs text-slate-400', 'Clipboard vazio.'))
+			renderEmptyFeed('Clipboard vazio.')
 			return
 		}
+		dom.feed.innerHTML = ''
 		for (let i = 0; i < state.clipboard.length; i++) {
 			const raw = state.clipboard[i]
 			const item =
@@ -496,28 +507,21 @@
 				create('div', 'whitespace-pre-wrap break-words text-xs text-slate-100', item.content)
 			)
 			const actions = create('div', 'mt-2 flex gap-2')
-			const copy = create(
-				'button',
+			const copy = createBtn(
 				'rounded bg-[#2d6cdf] px-2 py-1 text-[11px] text-white hover:bg-[#2258b8]',
-				'Copiar'
-			)
-			copy.onclick = () => {
+				'Copiar',
+				() => {
 				GM_setClipboard(item.content)
-				pushNotification({
-					title: 'Clipboard',
-					message: 'Copiado.',
-					level: 'success',
-					priority: null
-				})
-			}
+				notify('Clipboard', 'Copiado.', { level: 'success', priority: null })
+				}
+			)
 			actions.appendChild(copy)
 			if (item.owner === deviceId && item.id && !String(item.id).startsWith('legacy_')) {
-				const del = create(
-					'button',
+				const del = createBtn(
 					'rounded bg-rose-700 px-2 py-1 text-[11px] text-white',
-					'Apagar'
+					'Apagar',
+					() => send({ type: 'clipboard_delete', clipboardId: item.id })
 				)
-				del.onclick = () => send({ type: 'clipboard_delete', clipboardId: item.id })
 				actions.appendChild(del)
 			}
 			card.appendChild(actions)
@@ -555,7 +559,7 @@
 		const shouldStickBottom = previousScrollBottom < 24
 		dom.feed.innerHTML = ''
 		if (!feed.length) {
-			dom.feed.appendChild(create('div', 'text-xs text-slate-400', 'Sem mensagens ainda.'))
+			renderEmptyFeed('Sem mensagens ainda.')
 			return
 		}
 		for (const msg of feed.slice(-100)) {
@@ -620,36 +624,29 @@
 			{ id: 'clipboard', label: 'CLIPBOARD', icon: 'clip' },
 			{ id: 'log', label: 'LOG', icon: 'log' }
 		]
-		for (const t of fixed) {
+		const makeTab = (id, label, iconName) => {
 			const b = create(
 				'button',
 				'flex items-center gap-1 rounded border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-slate-200 hover:border-[#2d6cdf]'
 			)
-			b.innerHTML = `${icon(t.icon)}<span>${t.label}</span>`
-			const unread = getUnread(t.id)
-			if (unread) {
-				b.classList.add('ring-1', 'ring-sky-400', 'animate-pulse')
-				b.innerHTML += `<span class="ml-1 rounded-full bg-orange-500 px-1.5 text-[10px] text-white">${unread > 9 ? '9+' : unread}</span>`
-			}
-			b.onclick = () => activateTab(t.id)
-			dom.standardTabBar.appendChild(b)
-			dom.tabs[t.id] = b
-		}
-		for (const p of state.privateTabs) {
-			const id = `private:${p}`
-			const b = create(
-				'button',
-				'flex items-center gap-1 rounded border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-slate-200 hover:border-[#2d6cdf]'
-			)
-			b.innerHTML = `${icon('private')}<span>PRIVATE • ${p}</span>`
+			b.innerHTML = `${icon(iconName)}<span>${label}</span>`
 			const unread = getUnread(id)
 			if (unread) {
 				b.classList.add('ring-1', 'ring-sky-400', 'animate-pulse')
 				b.innerHTML += `<span class="ml-1 rounded-full bg-orange-500 px-1.5 text-[10px] text-white">${unread > 9 ? '9+' : unread}</span>`
 			}
 			b.onclick = () => activateTab(id)
-			dom.privateTabBar.appendChild(b)
 			dom.tabs[id] = b
+			return b
+		}
+		for (const t of fixed) {
+			const b = makeTab(t.id, t.label, t.icon)
+			dom.standardTabBar.appendChild(b)
+		}
+		for (const p of state.privateTabs) {
+			const id = `private:${p}`
+			const b = makeTab(id, `PRIVATE • ${p}`, 'private')
+			dom.privateTabBar.appendChild(b)
 		}
 		Object.entries(dom.tabs).forEach(([id, el]) => {
 			applyTabVisualState(el, id === state.activeTab)
@@ -714,12 +711,7 @@
 			dom.input.value = ''
 			return
 		}
-		pushNotification({
-			title: 'Melix',
-			message: 'Abra GLOBAL ou PRIVATE.',
-			level: 'warning',
-			priority: null
-		})
+		notify('Melix', 'Abra GLOBAL ou PRIVATE.', { level: 'warning', priority: null })
 	}
 
 	const buildUi = () => {
@@ -785,21 +777,11 @@
 		dom.clipBtn.onclick = () => {
 			const text = (dom.input.value || '').trim()
 			if (!text) {
-				pushNotification({
-					title: 'Clipboard',
-					message: 'Digite um texto para salvar.',
-					level: 'warning',
-					priority: null
-				})
+				notify('Clipboard', 'Digite um texto para salvar.', { level: 'warning', priority: null })
 				return
 			}
 			send({ type: 'clipboard_add', message: text })
-			pushNotification({
-				title: 'Clipboard',
-				message: 'Item salvo.',
-				level: 'success',
-				priority: null
-			})
+			notify('Clipboard', 'Item salvo.', { level: 'success', priority: null })
 			dom.input.value = ''
 		}
 		dom.compose.append(dom.input, dom.sendBtn, dom.clipBtn)
@@ -862,9 +844,7 @@
 			reconnectTimer = setTimeout(connect, opened ? 2500 : 1200)
 		}
 		socket.onerror = () => {
-			pushNotification({
-				title: 'Conexao',
-				message: `Falha ao conectar em ${currentUrl}`,
+			notify('Conexao', `Falha ao conectar em ${currentUrl}`, {
 				level: 'error',
 				priority: null,
 				reuseKey: 'system-connection'
@@ -890,9 +870,7 @@
 					typeof data.message === 'string' &&
 					data.message.includes('entrou no Melix')
 				if (!isSelfJoin) {
-					pushNotification({
-						title: 'Sistema',
-						message: data.message || 'Nova notificacao',
+					notify('Sistema', data.message || 'Nova notificacao', {
 						level: data.level || 'info',
 						priority: null,
 						reuseKey: 'system-notice'
