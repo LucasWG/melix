@@ -1,0 +1,302 @@
+# MELIX — Especificação Oficial do Sistema
+
+## 1. Visão Geral
+
+Melix é uma plataforma interna de comunicação e automação entre notebooks, baseada 100% em WebSocket (WSS), com clientes rodando via Tampermonkey e um servidor central em TypeScript.
+
+O sistema funciona como um hub de eventos em tempo real, permitindo comunicação entre máquinas dentro de uma rede corporativa, mesmo em ambientes com firewall restritivo, pois utiliza apenas conexões outbound via HTTPS/WSS (porta 443).
+
+O Melix não utiliza banco de dados. Todos os dados são mantidos em memória para manter o sistema leve, rápido e de baixo custo.
+
+---
+
+## 2. Arquitetura
+
+### Componentes
+
+**Clientes**
+
+* Tampermonkey
+* Conectam via WebSocket seguro (WSS)
+* Enviam e recebem eventos
+* Interface UI (chat, usuários, clipboard, notificações)
+
+**Servidor**
+
+* Node.js
+* TypeScript
+* uWebSockets.js
+* Armazenamento em memória
+* Atua como roteador de eventos
+
+**Proxy / HTTPS**
+
+* Caddy
+* Responsável por HTTPS automático
+* Reverse proxy para WebSocket
+* Porta 443
+
+**Infraestrutura**
+
+* DigitalOcean Droplet
+* Debian
+* PM2 para gerenciar o processo Node
+* pnpm como gerenciador de pacotes
+
+---
+
+## 3. Comunicação
+
+Toda comunicação do sistema é feita via WebSocket.
+
+Endpoint:
+
+```
+wss://melix.debugzone.com.br/ws
+```
+
+Formato padrão das mensagens:
+
+```json
+{
+  "type": "event_type",
+  "from": "device_id",
+  "to": "device_id",
+  "room": "room_name",
+  "message": "conteudo",
+  "timestamp": 123456789
+}
+```
+
+---
+
+## 4. Tipos de Eventos
+
+Eventos suportados pelo sistema:
+
+```
+register
+presence_list
+user_join
+user_leave
+
+chat_global
+chat_room
+chat_private
+
+join_room
+leave_room
+
+broadcast
+notification
+
+clipboard_add
+clipboard_history
+
+ping
+pong
+```
+
+---
+
+## 5. Funcionalidades do Sistema
+
+### 5.1 Presença (Usuários Online)
+
+* Monitorar usuários online em tempo real
+* Evento quando usuário entra
+* Evento quando usuário sai
+* Lista de usuários online
+* Atualização em tempo real via WebSocket
+
+### 5.2 Chat Global
+
+* Mensagens enviadas para todos os clientes conectados
+
+### 5.3 Chat por Salas
+
+* Usuários podem entrar em salas
+* Mensagens enviadas apenas para membros da sala
+* Usuários podem entrar e sair de salas
+
+### 5.4 Chat Privado (P2P)
+
+* Comunicação direta entre dois usuários
+* Servidor apenas encaminha a mensagem
+
+### 5.5 Broadcast
+
+* Mensagem enviada para todos os clientes
+* Usado para avisos gerais e notificações do sistema
+
+### 5.6 Notificações
+
+* Notificações internas do sistema
+* Exibidas como toast nos clientes
+* Níveis:
+
+  * info
+  * warning
+  * error
+  * success
+
+### 5.7 Clipboard Histórico
+
+* Clientes enviam conteúdo copiado
+* Servidor armazena últimos 30 itens
+* Clientes podem visualizar histórico
+* Clique copia novamente para clipboard
+
+---
+
+## 6. Estruturas em Memória (Servidor)
+
+O servidor mantém apenas estruturas em memória:
+
+```
+clients = Map<deviceId, websocket>
+rooms = Map<roomName, Set<deviceId>>
+onlineUsers = Set<deviceId>
+clipboardHistory = []
+```
+
+Sem banco de dados.
+
+---
+
+## 7. Estrutura do Projeto
+
+```
+melix/
+ ├── install_melix.sh
+ ├── server/
+ │   ├── src/
+ │   │   ├── index.ts
+ │   │   ├── websocket/
+ │   │   │     ├── server.ts
+ │   │   │     ├── events.ts
+ │   │   │     └── rooms.ts
+ │   │   ├── services/
+ │   │   │     ├── presence.ts
+ │   │   │     ├── chat.ts
+ │   │   │     ├── clipboard.ts
+ │   │   │     ├── notifications.ts
+ │   │   │     └── broadcast.ts
+ │   │   ├── models/
+ │   │   │     ├── client.ts
+ │   │   │     └── message.ts
+ │   │   └── utils/
+ │   │         └── logger.ts
+ │   ├── dist/
+ │   ├── package.json
+ │   ├── tsconfig.json
+ └── client/
+     └── tampermonkey.user.js
+```
+
+---
+
+## 8. Execução do Servidor
+
+### Desenvolvimento
+
+```
+pnpm run dev
+```
+
+### Build
+
+```
+pnpm run build
+```
+
+### Produção
+
+```
+pnpm run start
+```
+
+### Produção com PM2
+
+```
+pm2 start dist/index.js --name melix
+pm2 save
+pm2 startup
+```
+
+---
+
+## 9. Instalação Automatizada no Servidor
+
+O servidor possui um script de instalação automática:
+
+Arquivo:
+
+```
+install_melix.sh
+```
+
+Execução no droplet:
+
+```
+bash <(curl -s https://raw.githubusercontent.com/LucasWG/melix/main/install_melix.sh)
+```
+
+O script realiza automaticamente:
+
+* Atualização do sistema
+* Instala Node.js
+* Instala pnpm
+* Instala PM2
+* Instala Caddy
+* Clona ou atualiza o repositório
+* Instala dependências
+* Build do projeto
+* Configura Caddy
+* Reinicia Caddy
+* Inicia servidor com PM2
+
+O mesmo script funciona para:
+
+* Primeira instalação
+* Atualização do sistema
+* Deploy
+* Rebuild
+* Restart do servidor
+
+---
+
+## 10. Objetivo do Sistema
+
+O Melix é uma plataforma interna que futuramente poderá incluir:
+
+* Chat interno
+* Transferência de arquivos
+* Impressão remota
+* Screenshot remoto
+* Execução remota de comandos
+* Dashboard admin
+* Logs centralizados
+* Notificações de sistema
+* Atualização remota de scripts
+* Monitoramento de máquinas online
+
+O Melix funciona como um Hub de Comunicação e Automação em Tempo Real da empresa.
+
+---
+
+## 11. Resumo da Arquitetura
+
+```
+Tampermonkey Clients
+        ↓
+ wss://melix.debugzone.com.br/ws
+        ↓
+        Caddy
+        ↓
+ Node + uWebSockets
+        ↓
+ Memory (chat, rooms, presence, clipboard)
+```
+
+Sistema leve, sem banco de dados, baseado em eventos WebSocket.
